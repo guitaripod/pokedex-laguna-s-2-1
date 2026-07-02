@@ -23,3 +23,7 @@ node scripts/build-data.mjs && node scripts/build-moves.mjs
 wrangler dev
 wrangler deploy
 ```
+
+### The full session
+
+<img width="1918" height="2160" alt="fable5loweffortpokedexsessionfull" src="https://github.com/user-attachments/assets/82a1a696-54a2-43e7-994c-6a0d92b24648" />
