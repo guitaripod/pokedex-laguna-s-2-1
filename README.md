@@ -1,8 +1,8 @@
-# Pokédex — Fable Terminal
+# Pokédex — Laguna S-2.1
 
 A complete, production-grade Pokédex web app. Every Pokémon, every form, every stat — built on [PokéAPI](https://pokeapi.co) data, served as a static SPA on Cloudflare Workers.
 
-**Live:** https://pokedex-fable-5-low.guitaripod.workers.dev
+**Live:** https://pokedex-laguna-s-2-1.guitaripod.workers.dev
 
 ## Features
 

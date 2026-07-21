@@ -1,176 +1,370 @@
-import { writeFile, mkdir } from 'node:fs/promises'
+import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import { resolve } from 'path';
 
-const API = 'https://pokeapi.co/api/v2'
-const OUT = new URL('../public/data/', import.meta.url)
-const CONCURRENCY = 25
+const API_BASE = 'https://pokeapi.co/api/v2';
+const DATA_DIR = resolve(process.cwd(), 'public', 'data');
+const CACHE_TTL = 86400;
 
-async function getJSON(url, attempt = 1) {
-  try {
-    const res = await fetch(url)
-    if (!res.ok) throw new Error(`${res.status} ${url}`)
-    return await res.json()
-  } catch (e) {
-    if (attempt >= 5) throw e
-    await new Promise(r => setTimeout(r, attempt * 1500))
-    return getJSON(url, attempt + 1)
-  }
-}
-
-async function pool(items, fn) {
-  const results = new Array(items.length)
-  let i = 0, done = 0
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++
-      results[idx] = await fn(items[idx], idx)
-      if (++done % 100 === 0) console.log(`  ${done}/${items.length}`)
+async function fetchWithCache(url: string): Promise<any> {
+  const cachePath = resolve(DATA_DIR, '.cache', `${encodeURIComponent(url)}.json`);
+  if (existsSync(cachePath)) {
+    const stats = require('fs').statSync(cachePath);
+    if (Date.now() - stats.mtimeMs < CACHE_TTL * 1000) {
+      return JSON.parse(require('fs').readFileSync(cachePath, 'utf-8'));
     }
   }
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker))
-  return results
-}
 
-const idOf = url => Number(url.split('/').filter(Boolean).pop())
-
-function pickFlavor(entries) {
-  const en = entries.filter(e => e.language.name === 'en')
-  return en.length ? en[en.length - 1].flavor_text.replace(/[\n\f\r]+/g, ' ').trim() : ''
-}
-
-function englishName(names, fallback) {
-  const en = names?.find(n => n.language.name === 'en')
-  return en ? en.name : fallback
-}
-
-console.log('Fetching lists...')
-const [pokeList, speciesList, typeList] = await Promise.all([
-  getJSON(`${API}/pokemon?limit=100000`),
-  getJSON(`${API}/pokemon-species?limit=100000`),
-  getJSON(`${API}/type?limit=100`),
-])
-
-console.log(`Pokemon: ${pokeList.results.length}, Species: ${speciesList.results.length}`)
-
-console.log('Fetching species...')
-const speciesRaw = await pool(speciesList.results, s => getJSON(s.url))
-const speciesById = new Map(speciesRaw.map(s => [s.id, s]))
-
-console.log('Fetching pokemon...')
-const pokeRaw = await pool(pokeList.results, p => getJSON(p.url))
-
-console.log('Fetching evolution chains...')
-const chainIds = [...new Set(speciesRaw.map(s => s.evolution_chain ? idOf(s.evolution_chain.url) : null).filter(Boolean))]
-const chainsRaw = await pool(chainIds, id => getJSON(`${API}/evolution-chain/${id}`))
-
-console.log('Fetching types...')
-const mainTypes = typeList.results.filter(t => !['unknown', 'shadow', 'stellar'].includes(t.name))
-const typesRaw = await pool(mainTypes, t => getJSON(t.url))
-
-console.log('Fetching abilities...')
-const abilityList = await getJSON(`${API}/ability?limit=1000`)
-const abilitiesRaw = await pool(abilityList.results, a => getJSON(a.url))
-
-console.log('Fetching generations...')
-const genList = await getJSON(`${API}/generation?limit=50`)
-const gensRaw = await pool(genList.results, g => getJSON(g.url))
-const genBySpecies = new Map()
-for (const g of gensRaw) for (const s of g.pokemon_species) genBySpecies.set(idOf(s.url), g.id)
-
-function simplifyChain(node) {
-  return {
-    species: idOf(node.species.url),
-    name: node.species.name,
-    evolves_to: node.evolves_to.map(simplifyChain),
-    details: (node.evolution_details || []).slice(0, 1).map(d => ({
-      trigger: d.trigger?.name || null,
-      min_level: d.min_level,
-      item: d.item?.name || null,
-      held_item: d.held_item?.name || null,
-      min_happiness: d.min_happiness,
-      min_beauty: d.min_beauty,
-      min_affection: d.min_affection,
-      time_of_day: d.time_of_day || null,
-      location: d.location?.name || null,
-      known_move: d.known_move?.name || null,
-      known_move_type: d.known_move_type?.name || null,
-      trade_species: d.trade_species?.name || null,
-      needs_overworld_rain: d.needs_overworld_rain || false,
-      gender: d.gender,
-    }))[0] || null,
+  console.log(`Fetching: ${url}`);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch ${url}: ${response.status}`);
   }
+  const data = await response.json();
+
+  if (!existsSync(resolve(DATA_DIR, '.cache'))) {
+    mkdirSync(resolve(DATA_DIR, '.cache'), { recursive: true });
+  }
+  writeFileSync(cachePath, JSON.stringify(data));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  return data;
 }
 
-const evolution = {}
-for (const c of chainsRaw) evolution[c.id] = simplifyChain(c.chain)
+async function buildPokemonList() {
+  console.log('Building Pokemon list...');
+  const list = await fetchWithCache(`${API_BASE}/pokemon?limit=1351&offset=0`);
+  const pokemon = list.results.map((p: any) => {
+    const id = parseInt(p.url.split('/').slice(-2)[0]);
+    return { id, name: p.name, url: p.url };
+  });
 
-const abilities = {}
-for (const a of abilitiesRaw) {
-  const en = a.effect_entries.find(e => e.language.name === 'en')
-  const flavorEn = a.flavor_text_entries.filter(e => e.language.name === 'en')
-  abilities[a.name] = {
-    name: englishName(a.names, a.name),
-    effect: en ? en.short_effect : (flavorEn.length ? flavorEn[flavorEn.length - 1].flavor_text.replace(/[\n\f]+/g, ' ') : ''),
-  }
+  writeFileSync(resolve(DATA_DIR, 'pokemon-list.json'), JSON.stringify(pokemon));
+  console.log(`  Saved ${pokemon.length} Pokemon`);
 }
 
-const types = {}
-for (const t of typesRaw) {
-  types[t.name] = {
-    double_to: t.damage_relations.double_damage_to.map(x => x.name),
-    half_to: t.damage_relations.half_damage_to.map(x => x.name),
-    no_to: t.damage_relations.no_damage_to.map(x => x.name),
-    double_from: t.damage_relations.double_damage_from.map(x => x.name),
-    half_from: t.damage_relations.half_damage_from.map(x => x.name),
-    no_from: t.damage_relations.no_damage_from.map(x => x.name),
-  }
+async function buildSpeciesList() {
+  console.log('Building species list...');
+  const list = await fetchWithCache(`${API_BASE}/pokemon-species?limit=1025&offset=0`);
+  const species = list.results.map((s: any) => {
+    const id = parseInt(s.url.split('/').slice(-2)[0]);
+    return { id, name: s.name, url: s.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'species-list.json'), JSON.stringify(species));
+  console.log(`  Saved ${species.length} species`);
 }
 
-const statOrder = ['hp', 'attack', 'defense', 'special-attack', 'special-defense', 'speed']
+async function buildTypeList() {
+  console.log('Building type list...');
+  const list = await fetchWithCache(`${API_BASE}/type`);
+  const types = list.results.map((t: any) => ({ name: t.name, url: t.url }));
 
-const dex = pokeRaw.filter(Boolean).map(p => {
-  const sp = speciesById.get(idOf(p.species.url))
-  if (!sp) return null
-  const stats = statOrder.map(name => p.stats.find(s => s.stat.name === name)?.base_stat ?? 0)
-  const evs = statOrder.map(name => p.stats.find(s => s.stat.name === name)?.effort ?? 0)
-  return {
-    id: p.id,
-    name: p.name,
-    label: englishName(sp.names, sp.name),
-    species: sp.id,
-    default: p.is_default,
-    types: p.types.sort((a, b) => a.slot - b.slot).map(t => t.type.name),
-    stats,
-    evs,
-    height: p.height,
-    weight: p.weight,
-    base_exp: p.base_experience,
-    abilities: p.abilities.sort((a, b) => a.slot - b.slot).map(a => ({ n: a.ability.name, h: a.is_hidden })),
-    genus: englishName(sp.genera?.map(g => ({ ...g, name: g.genus })), '') || (sp.genera?.find(g => g.language.name === 'en')?.genus ?? ''),
-    flavor: pickFlavor(sp.flavor_text_entries || []),
-    gen: genBySpecies.get(sp.id) || sp.generation ? (genBySpecies.get(sp.id) ?? idOf(sp.generation.url)) : null,
-    color: sp.color?.name || null,
-    shape: sp.shape?.name || null,
-    habitat: sp.habitat?.name || null,
-    capture_rate: sp.capture_rate,
-    base_happiness: sp.base_happiness,
-    growth: sp.growth_rate?.name || null,
-    egg_groups: sp.egg_groups.map(e => e.name),
-    gender_rate: sp.gender_rate,
-    hatch_counter: sp.hatch_counter,
-    legendary: sp.is_legendary,
-    mythical: sp.is_mythical,
-    baby: sp.is_baby,
-    chain: sp.evolution_chain ? idOf(sp.evolution_chain.url) : null,
-    varieties: sp.varieties.map(v => idOf(v.pokemon.url)),
-    has_art: !!p.sprites.other?.['official-artwork']?.front_default,
-    has_anim: !!p.sprites.other?.showdown?.front_default,
-    cry: !!p.cries?.latest,
+  writeFileSync(resolve(DATA_DIR, 'type-list.json'), JSON.stringify(types));
+  console.log(`  Saved ${types.length} types`);
+}
+
+async function buildMoveList() {
+  console.log('Building move list...');
+  const list = await fetchWithCache(`${API_BASE}/move?limit=937&offset=0`);
+  const moves = list.results.map((m: any) => {
+    const id = parseInt(m.url.split('/').slice(-2)[0]);
+    return { id, name: m.name, url: m.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'move-list.json'), JSON.stringify(moves));
+  console.log(`  Saved ${moves.length} moves`);
+}
+
+async function buildItemList() {
+  console.log('Building item list...');
+  const list = await fetchWithCache(`${API_BASE}/item?limit=2221&offset=0`);
+  const items = list.results.map((i: any) => {
+    const id = parseInt(i.url.split('/').slice(-2)[0]);
+    return { id, name: i.name, url: i.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'item-list.json'), JSON.stringify(items));
+  console.log(`  Saved ${items.length} items`);
+}
+
+async function buildAbilityList() {
+  console.log('Building ability list...');
+  const list = await fetchWithCache(`${API_BASE}/ability?limit=373&offset=0`);
+  const abilities = list.results.map((a: any) => {
+    const id = parseInt(a.url.split('/').slice(-2)[0]);
+    return { id, name: a.name, url: a.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'ability-list.json'), JSON.stringify(abilities));
+  console.log(`  Saved ${abilities.length} abilities`);
+}
+
+async function buildEvolutionChainList() {
+  console.log('Building evolution chain list...');
+  const list = await fetchWithCache(`${API_BASE}/evolution-chain?limit=541&offset=0`);
+  const chains = list.results.map((c: any) => {
+    const id = parseInt(c.url.split('/').slice(-2)[0]);
+    return { id, name: c.name, url: c.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'evolution-chain-list.json'), JSON.stringify(chains));
+  console.log(`  Saved ${chains.length} evolution chains`);
+}
+
+async function buildLocationList() {
+  console.log('Building location list...');
+  const list = await fetchWithCache(`${API_BASE}/location?limit=1103&offset=0`);
+  const locations = list.results.map((l: any) => {
+    const id = parseInt(l.url.split('/').slice(-2)[0]);
+    return { id, name: l.name, url: l.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'location-list.json'), JSON.stringify(locations));
+  console.log(`  Saved ${locations.length} locations`);
+}
+
+async function buildRegionList() {
+  console.log('Building region list...');
+  const list = await fetchWithCache(`${API_BASE}/region`);
+  const regions = list.results.map((r: any) => ({ name: r.name, url: r.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'region-list.json'), JSON.stringify(regions));
+  console.log(`  Saved ${regions.length} regions`);
+}
+
+async function buildVersionList() {
+  console.log('Building version list...');
+  const list = await fetchWithCache(`${API_BASE}/version`);
+  const versions = list.results.map((v: any) => ({ name: v.name, url: v.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'version-list.json'), JSON.stringify(versions));
+  console.log(`  Saved ${versions.length} versions`);
+}
+
+async function buildVersionGroupList() {
+  console.log('Building version group list...');
+  const list = await fetchWithCache(`${API_BASE}/version-group`);
+  const versionGroups = list.results.map((v: any) => ({ name: v.name, url: v.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'version-group-list.json'), JSON.stringify(versionGroups));
+  console.log(`  Saved ${versionGroups.length} version groups`);
+}
+
+async function buildNatureList() {
+  console.log('Building nature list...');
+  const list = await fetchWithCache(`${API_BASE}/nature?limit=25&offset=0`);
+  const natures = list.results.map((n: any) => {
+    const id = parseInt(n.url.split('/').slice(-2)[0]);
+    return { id, name: n.name, url: n.url };
+  });
+
+  writeFileSync(resolve(DATA_DIR, 'nature-list.json'), JSON.stringify(natures));
+  console.log(`  Saved ${natures.length} natures`);
+}
+
+async function buildEggGroupList() {
+  console.log('Building egg group list...');
+  const list = await fetchWithCache(`${API_BASE}/egg-group`);
+  const eggGroups = list.results.map((e: any) => ({ name: e.name, url: e.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'egg-group-list.json'), JSON.stringify(eggGroups));
+  console.log(`  Saved ${eggGroups.length} egg groups`);
+}
+
+async function buildGrowthRateList() {
+  console.log('Building growth rate list...');
+  const list = await fetchWithCache(`${API_BASE}/growth-rate`);
+  const growthRates = list.results.map((g: any) => ({ name: g.name, url: g.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'growth-rate-list.json'), JSON.stringify(growthRates));
+  console.log(`  Saved ${growthRates.length} growth rates`);
+}
+
+async function buildStatList() {
+  console.log('Building stat list...');
+  const list = await fetchWithCache(`${API_BASE}/stat?limit=100&offset=0`);
+  const stats = list.results.map((s: any) => ({ name: s.name, url: s.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'stat-list.json'), JSON.stringify(stats));
+  console.log(`  Saved ${stats.length} stats`);
+}
+
+async function buildMoveDamageClassList() {
+  console.log('Building move damage class list...');
+  const list = await fetchWithCache(`${API_BASE}/move-damage-class`);
+  const damageClasses = list.results.map((d: any) => ({ name: d.name, url: d.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'move-damage-class-list.json'), JSON.stringify(damageClasses));
+  console.log(`  Saved ${damageClasses.length} damage classes`);
+}
+
+async function buildMoveTargetList() {
+  console.log('Building move target list...');
+  const list = await fetchWithCache(`${API_BASE}/move-target`);
+  const targets = list.results.map((t: any) => ({ name: t.name, url: t.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'move-target-list.json'), JSON.stringify(targets));
+  console.log(`  Saved ${targets.length} move targets`);
+}
+
+async function buildMoveCategoryList() {
+  console.log('Building move category list...');
+  const list = await fetchWithCache(`${API_BASE}/move-category`);
+  const categories = list.results.map((c: any) => ({ name: c.name, url: c.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'move-category-list.json'), JSON.stringify(categories));
+  console.log(`  Saved ${categories.length} move categories`);
+}
+
+async function buildItemCategoryList() {
+  console.log('Building item category list...');
+  const list = await fetchWithCache(`${API_BASE}/item-category`);
+  const categories = list.results.map((c: any) => ({ name: c.name, url: c.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'item-category-list.json'), JSON.stringify(categories));
+  console.log(`  Saved ${categories.length} item categories`);
+}
+
+async function buildItemFlingEffectList() {
+  console.log('Building item fling effect list...');
+  const list = await fetchWithCache(`${API_BASE}/item-fling-effect`);
+  const effects = list.results.map((e: any) => ({ name: e.name, url: e.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'item-fling-effect-list.json'), JSON.stringify(effects));
+  console.log(`  Saved ${effects.length} fling effects`);
+}
+
+async function buildEncounterMethodList() {
+  console.log('Building encounter method list...');
+  const list = await fetchWithCache(`${API_BASE}/encounter-method`);
+  const methods = list.results.map((m: any) => ({ name: m.name, url: m.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'encounter-method-list.json'), JSON.stringify(methods));
+  console.log(`  Saved ${methods.length} encounter methods`);
+}
+
+async function buildEncounterConditionList() {
+  console.log('Building encounter condition list...');
+  const list = await fetchWithCache(`${API_BASE}/encounter-condition`);
+  const conditions = list.results.map((c: any) => ({ name: c.name, url: c.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'encounter-condition-list.json'), JSON.stringify(conditions));
+  console.log(`  Saved ${conditions.length} encounter conditions`);
+}
+
+async function buildEvolutionTriggerList() {
+  console.log('Building evolution trigger list...');
+  const list = await fetchWithCache(`${API_BASE}/evolution-trigger`);
+  const triggers = list.results.map((t: any) => ({ name: t.name, url: t.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'evolution-trigger-list.json'), JSON.stringify(triggers));
+  console.log(`  Saved ${triggers.length} evolution triggers`);
+}
+
+async function buildLanguageList() {
+  console.log('Building language list...');
+  const list = await fetchWithCache(`${API_BASE}/language?limit=100&offset=0`);
+  const languages = list.results.map((l: any) => ({ name: l.name, url: l.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'language-list.json'), JSON.stringify(languages));
+  console.log(`  Saved ${languages.length} languages`);
+}
+
+async function buildPalPadList() {
+  console.log('Building Pal Pad list...');
+  const list = await fetchWithCache(`${API_BASE}/pal-pad`);
+  const palPad = list.results.map((p: any) => ({ name: p.name, url: p.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'pal-pad-list.json'), JSON.stringify(palPad));
+  console.log(`  Saved ${palPad.length} Pal Pad entries`);
+}
+
+async function buildBerryList() {
+  console.log('Building berry list...');
+  const list = await fetchWithCache(`${API_BASE}/berry?limit=100&offset=0`);
+  const berries = list.results.map((b: any) => ({ name: b.name, url: b.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'berry-list.json'), JSON.stringify(berries));
+  console.log(`  Saved ${berries.length} berries`);
+}
+
+async function buildBerryFirmnessList() {
+  console.log('Building berry firmness list...');
+  const list = await fetchWithCache(`${API_BASE}/berry-firmness`);
+  const firmness = list.results.map((b: any) => ({ name: b.name, url: b.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'berry-firmness-list.json'), JSON.stringify(firmness));
+  console.log(`  Saved ${firmness.length} berry firmness`);
+}
+
+async function buildBerryFlavorList() {
+  console.log('Building berry flavor list...');
+  const list = await fetchWithCache(`${API_BASE}/berry-flavor`);
+  const flavors = list.results.map((b: any) => ({ name: b.name, url: b.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'berry-flavor-list.json'), JSON.stringify(flavors));
+  console.log(`  Saved ${flavors.length} berry flavors`);
+}
+
+async function buildContestTypeList() {
+  console.log('Building contest type list...');
+  const list = await fetchWithCache(`${API_BASE}/contest-type`);
+  const contestTypes = list.results.map((c: any) => ({ name: c.name, url: c.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'contest-type-list.json'), JSON.stringify(contestTypes));
+  console.log(`  Saved ${contestTypes.length} contest types`);
+}
+
+async function buildSuperTrainingList() {
+  console.log('Building super training list...');
+  const list = await fetchWithCache(`${API_BASE}/super-training`);
+  const superTraining = list.results.map((s: any) => ({ name: s.name, url: s.url }));
+
+  writeFileSync(resolve(DATA_DIR, 'super-training-list.json'), JSON.stringify(superTraining));
+  console.log(`  Saved ${superTraining.length} super training entries`);
+}
+
+async function buildAll() {
+  console.log('Starting data build...\n');
+
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
   }
-}).filter(Boolean).sort((a, b) => a.id - b.id)
 
-await mkdir(OUT, { recursive: true })
-await writeFile(new URL('pokedex.json', OUT), JSON.stringify(dex))
-await writeFile(new URL('evolution.json', OUT), JSON.stringify(evolution))
-await writeFile(new URL('types.json', OUT), JSON.stringify(types))
-await writeFile(new URL('abilities.json', OUT), JSON.stringify(abilities))
-console.log(`Wrote ${dex.length} pokemon, ${Object.keys(evolution).length} chains, ${Object.keys(types).length} types, ${Object.keys(abilities).length} abilities`)
+  await Promise.all([
+    buildPokemonList(),
+    buildSpeciesList(),
+    buildTypeList(),
+    buildMoveList(),
+    buildItemList(),
+    buildAbilityList(),
+    buildEvolutionChainList(),
+    buildLocationList(),
+    buildRegionList(),
+    buildVersionList(),
+    buildVersionGroupList(),
+    buildNatureList(),
+    buildEggGroupList(),
+    buildGrowthRateList(),
+    buildStatList(),
+    buildMoveDamageClassList(),
+    buildMoveTargetList(),
+    buildMoveCategoryList(),
+    buildItemCategoryList(),
+    buildItemFlingEffectList(),
+    buildEncounterMethodList(),
+    buildEncounterConditionList(),
+    buildEvolutionTriggerList(),
+    buildLanguageList(),
+    buildPalPadList(),
+    buildBerryList(),
+    buildBerryFirmnessList(),
+    buildBerryFlavorList(),
+    buildContestTypeList(),
+    buildSuperTrainingList(),
+  ]);
+
+  console.log('\nData build complete!');
+}
+
+buildAll().catch(console.error);
